@@ -20,6 +20,7 @@ import select, stat, string, sqlite3, subprocess, sys, tempfile, time
 import synctus.ddar_pb2, synctus.dds
 import synctus.netstring as netstring
 
+
 DEFAULT_REMOTE_PIPELINE_SIZE = '8' # string for cmdline equiv.
 
 # Protocol magic and version exchange is as follows:
@@ -34,7 +35,7 @@ DEFAULT_REMOTE_PIPELINE_SIZE = '8' # string for cmdline equiv.
 # For passive mode, await magic from step 3 moves to step 0.
 
 PROTOCOL_MAGIC = "ddar"
-PROTOCOL_VERSION = "1" # ASCII decimal string for readability
+PROTOCOL_VERSION = "2" # ASCII decimal string for readability
 
 def _sysread(fileobj, bufsize=4096):
     '''Read up to bufsize bytes, whatever is available, blocking until at least
@@ -170,9 +171,9 @@ class Archive(object):
 
         version = self._read_small_file(self._format_filename('version'))
         version = version.lstrip().rstrip()
-        if version != '1':
+        if version != '2':
             raise ConsoleError('%s uses ddar archive version %s but only' +
-                               'version 1 is supported' % self.dirname)
+                               'version 2 is supported' % (self.dirname, version))
 
         self.db = sqlite3.connect(os.path.join(self.dirname, 'db'))
         self.db.text_factory = str
@@ -195,35 +196,50 @@ class Archive(object):
         finally:
             f.close()
 
+    @staticmethod
+    def _create_tables(cursor):
+
+        cursor.execute('''
+CREATE TABLE member (member_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        length INTEGER,
+        hash BLOB,
+        create_time INTEGER,
+        PRIMARY KEY (member_id), 
+        UNIQUE (member_id), 
+        UNIQUE (name))''')
+
+        cursor.execute('''
+CREATE TABLE mc (mc_id INTEGER NOT NULL,
+        member_id INTEGER,
+        chunk_id INTEGER,
+        offset INTEGER NOT NULL,
+        PRIMARY KEY (mc_id),
+        UNIQUE (mc_id),
+        FOREIGN KEY(member_id) REFERENCES "member" (member_id) ON DELETE CASCADE,
+        FOREIGN KEY(chunk_id) REFERENCES "chunk" (chunk_id))''')
+
+        cursor.execute('''
+CREATE TABLE chunk (chunk_id INTEGER NOT NULL,
+        hash BLOB NOT NULL,
+        length INTEGER NOT NULL,
+        PRIMARY KEY (chunk_id), 
+        UNIQUE (chunk_id), 
+        UNIQUE (hash))''')
+        
+        cursor.execute('CREATE UNIQUE INDEX idx_mc_member_id_chunk_id_offset ON "mc" (member_id, chunk_id, "offset")')
+
     def _create(self):
         os.mkdir(self.dirname)
         os.mkdir(os.path.join(self.dirname, 'format'))
         os.mkdir(os.path.join(self.dirname, 'objects'))
 
         self._write_small_file(self._format_filename('name'), "ddar\n")
-        self._write_small_file(self._format_filename('version'), "1\n")
+        self._write_small_file(self._format_filename('version'), "2\n")
 
         db = sqlite3.connect(os.path.join(self.dirname, 'db'))
         c = db.cursor()
-        c.execute('''
-CREATE TABLE member (id INTEGER PRIMARY KEY,
-                      name TEXT UNIQUE NOT NULL,
-                      length INTEGER,
-                      hash BLOB,
-                      create_time INTEGER)''')
-        c.execute('''
-CREATE TABLE chunk (member_id INTEGER NOT NULL,
-                    hash BLOB NOT NULL,
-                    offset INTEGER NOT NULL,
-                    length INTEGER NOT NULL,
-                    UNIQUE (member_id, offset),
-                    FOREIGN KEY (member_id) REFERENCES member(id))''')
-        # No need for a (tag,offset) index as we have a UNIQUE
-        # constraint on it. This causes sqlite to generate an index and
-        # the documentatation states that there is a performance degradation
-        # by having an extra index instead of relying on this fact.
-        c.execute('CREATE INDEX chunk_hash_idx ON chunk(hash)')
-        c.execute('CREATE INDEX member_create_time_idx ON member(create_time)')
+        self._create_tables(c)
         c.close()
         db.commit()
         db.close()
@@ -254,11 +270,16 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
     @staticmethod
     def _have_chunk(cursor, h):
         h_blob = buffer(h) # buffer to make sqlite use a BLOB
-        cursor.execute('SELECT 1 FROM chunk WHERE hash=? LIMIT 1', (h_blob,))
-        return _ImmediateRequest(bool(cursor.fetchone()))
+        cursor.execute('SELECT chunk_id FROM chunk WHERE hash=?', (h_blob,))
+        row = cursor.fetchone()
+        if row:
+            assert(row[0] > 0)
+            return _ImmediateRequest(row[0])
+        else:
+            return _ImmediateRequest(0)
 
     def _store_chunk(self, member_id, cursor, data, offset, length,
-                     sha256=None):
+                     sha256=None, chunk_id=None):
         '''Store the chunk in the database and the object store if necessary,
         but do not commit. The database insert is done last, so that if
         interrupted the database is never wrong. At worst a dangling object
@@ -276,7 +297,9 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
             assert(sha256 is None or sha256 == h)
             assert(len(data) == length)
 
-        if not self._have_chunk(cursor, h).reply:
+        h_blob = buffer(h) # buffer to make sqlite use a BLOB
+        
+        if not chunk_id:
             assert(data is not None)
             object_filename = self._object_filename(h)
             object_dir = os.path.dirname(object_filename)
@@ -289,11 +312,26 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
                 temp.close()
             os.rename(temp_name, object_filename)
 
-        h_blob = buffer(h)
-        cursor.execute('INSERT INTO chunk ' +
-                       '(member_id, hash, offset, length) ' +
-                       'VALUES (?, ?, ?, ?)',
-                       (member_id, h_blob, offset, length))
+            try:
+                cursor.execute('INSERT INTO chunk (hash, length) ' +
+                               'VALUES (?, ?)', (h_blob, length))
+            except sqlite3.IntegrityError as err: 
+                # can happen if a chunk in the pipeline>0 has already been stored
+                cursor.execute('SELECT chunk_id FROM chunk WHERE hash=?',
+                               (h_blob,))
+                row = cursor.fetchone()
+                if not row:
+                    raise
+                else:
+                    chunk_id = row[0]
+            else:
+                chunk_id = cursor.lastrowid
+
+
+        # always create a new relation
+        cursor.execute('INSERT INTO mc (member_id, chunk_id, offset) ' +
+                       'VALUES (?, ?, ?)',
+                       (member_id, chunk_id, offset))
 
     @staticmethod
     def _store_add_member(cursor, tag):
@@ -304,13 +342,13 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
         cursor.execute('INSERT INTO member (name, create_time) VALUES (?, ?)',
                        (tag, int(time.time())))
         member_id = cursor.lastrowid
-        cursor.execute('DELETE FROM chunk WHERE member_id=?', (member_id,))
+        #cursor.execute('DELETE FROM chunk WHERE member_id=?', (member_id,))
         return member_id
 
     def _store_complete_member(self, cursor, h, length, member_id):
         h_blob = buffer(h)
         cursor.execute('UPDATE member SET hash=?, length=? WHERE ' +
-                       'id=?', (h_blob, length, member_id))
+                       'member_id=?', (h_blob, length, member_id))
         return _ImmediateRequest(None)
 
     def _store_commit(self, cursor):
@@ -363,12 +401,16 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
         def out_fn(request, data, chunk_h, offset, length):
             if request.reply:
                 data = None
+                chunk_id = request.reply
+            else:
+                chunk_id = None
             self._store_chunk(member_id=member_id,
                               cursor=cursor,
                               data=data,
                               offset=offset,
                               length=length,
-                              sha256=chunk_h)
+                              sha256=chunk_h,
+                              chunk_id=chunk_id)
 
         work_pipeline = _WorkPipeline(pipeline_size, in_fn, out_fn)
         work_pipeline.feed_and_flush(dds.chunks())
@@ -399,7 +441,7 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
 
         def _rpc_have_chunk_request(self, req):
             reply = synctus.ddar_pb2.HaveChunkReply()
-            reply.have = self.archive._have_chunk(self.cursor, req.sha256).reply
+            reply.chunk_id = self.archive._have_chunk(self.cursor, req.sha256).reply
             reply.sha256 = req.sha256
             return reply
 
@@ -408,13 +450,18 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
                 data = req.data
             else:
                 data = None
+            if req.HasField('chunk_id'):
+                chunk_id = req.chunk_id
+            else:
+                chunk_id = None
 
             self.archive._store_chunk(member_id=self.member_id,
                                       cursor=self.cursor,
                                       data=data,
                                       offset=req.offset,
                                       length=req.length,
-                                      sha256=req.sha256)
+                                      sha256=req.sha256,
+                                      chunk_id=chunk_id)
             reply = synctus.ddar_pb2.StoreChunkReply()
             reply.sha256 = req.sha256
             return reply
@@ -479,22 +526,24 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
 
     def load(self, tag, f=sys.stdout):
         cursor = self.db.cursor()
-        cursor.execute('SELECT id, hash FROM member WHERE name=?', (tag,))
+        cursor.execute('SELECT member_id, hash FROM member WHERE name=?', (tag,))
         row = cursor.fetchone()
         if not row:
             raise ConsoleError('member %s not found in archive' % tag)
 
         member_id, h = row
         expected_h = str(h)
-        cursor.execute('SELECT hash, offset, length ' +
-                       'FROM chunk WHERE member_id=? ' +
-                       'ORDER BY offset', (member_id,))
+
+        cursor.execute('SELECT chunk.hash, chunk.length, mc.offset ' +
+                       'FROM chunk '
+                       'INNER JOIN mc ON chunk.chunk_id=mc.chunk_id ' +
+                       'WHERE member_id=? ORDER BY mc.offset', (member_id,))
 
         h2 = hashlib.sha256()
         next_offset = 0
         row = cursor.fetchone()
         while row:
-            h, offset, length = row
+            h, length, offset = row
             assert(offset == next_offset)
             g = open(self._object_filename(h), 'rb')
             try:
@@ -514,33 +563,41 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
     def delete(self, tag):
         cursor = self.db.cursor()
         cursor2 = self.db.cursor()
-        cursor.execute('SELECT id FROM member WHERE name=?', (tag,))
+        cursor.execute('SELECT member_id FROM member WHERE name=?', (tag,))
         row = cursor.fetchone()
         if not row:
             raise ConsoleError('member %s not found in archive' % tag)
         member_id = row[0]
-        cursor.execute('SELECT hash FROM chunk WHERE member_id=?',
-                       (member_id,))
+        
+        self.db.execute('PRAGMA foreign_keys = ON')
+        cursor.execute('DELETE FROM member WHERE member_id=?', (member_id,))
+        
+        # Need to commit here else foreign keys will still be enabled below
+        self.db.commit()
+        
+        cursor.execute('SELECT hash FROM chunk WHERE NOT (EXISTS ' +
+                        '(SELECT 1 FROM mc WHERE chunk.chunk_id=mc.chunk_id))')
         row = cursor.fetchone()
+        
         while row:
             h = row[0]
-            cursor2.execute('SELECT 1 FROM chunk WHERE hash=? AND ' +
-                            'member_id != ? LIMIT 1', (h, member_id))
-            if not cursor2.fetchone():
-                try:
-                    object_filename = self._object_filename(h)
-                    os.unlink(object_filename)
-                    self._removedirs(object_filename)
-                except OSError, e:
-                    # ignore ENOENT to make delete idempotent on a SIGINT
-                    if e.errno != errno.ENOENT:
-                        raise
+            object_filename = self._object_filename(h)
+            try:
+                os.unlink(object_filename)
+                self._removedirs(object_filename)
+            except OSError, e:
+                # ignore ENOENT to make delete idempotent on a SIGINT
+                if e.errno != errno.ENOENT:
+                    raise
             row = cursor.fetchone()
-        cursor.execute('DELETE FROM chunk WHERE member_id=?', (member_id,))
-        cursor.execute('DELETE FROM member WHERE id=?', (member_id,))
-        cursor.close()
-        self.db.commit()
 
+        self.db.execute('PRAGMA foreign_keys = OFF')
+        cursor.execute('DELETE FROM chunk WHERE NOT (EXISTS ' +
+                       '(SELECT 1 FROM mc WHERE chunk.chunk_id=mc.chunk_id))')
+        self.db.commit()
+        cursor.close()
+        self.db.execute('PRAGMA foreign_keys = ON')
+        
     def list_tags(self):
         cursor = self.db.cursor()
         cursor.execute('SELECT name FROM member')
@@ -610,7 +667,7 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
         cursor = self.db.cursor()
 
         # Check each hash is correct
-        cursor.execute('SELECT DISTINCT hash, length FROM chunk')
+        cursor.execute('SELECT hash, length FROM chunk')
 
         row = cursor.fetchone()
         while row:
@@ -641,20 +698,23 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
     def _fsck_db_to_fs_member(self):
         status = True
 
-        cursor = self.db.cursor()
+        cursor1 = self.db.cursor()
         cursor2 = self.db.cursor()
         # Check each member hash is correct
-        cursor.execute('SELECT id, name, hash FROM member')
-        row = cursor.fetchone()
+        cursor1.execute('SELECT member_id, name, hash FROM member')
+        row = cursor1.fetchone()
+        
         while row:
             member_id, tag, h = row
             h = str(h)
 
-            cursor2.execute('SELECT hash FROM chunk WHERE member_id=? ' +
-                            'ORDER BY offset', (member_id,))
+            cursor2.execute('SELECT chunk.hash FROM chunk '
+                            'INNER JOIN mc ON chunk.chunk_id=mc.chunk_id ' +
+                            'WHERE member_id=? ORDER BY mc.offset', (member_id,))
 
             h2 = hashlib.sha256()
             row2 = cursor2.fetchone()
+
             while row2:
                 chunk_hash = row2[0]
                 try:
@@ -676,7 +736,7 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
                 print '%s: hash mismatch' % tag
                 status = False
 
-            row = cursor.fetchone()
+            row = cursor1.fetchone()
         
         return status
 
@@ -686,17 +746,19 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
         cursor = self.db.cursor()
         cursor2 = self.db.cursor()
 
-        # Check through each member in the chunk table
-        cursor.execute('SELECT member_id, offset, length FROM chunk ' +
-                       'ORDER BY member_id, offset')
+        cursor.execute('SELECT mc.member_id, mc.offset, chunk.length FROM chunk ' + 
+                       'INNER JOIN mc ON chunk.chunk_id=mc.chunk_id '
+                       'ORDER BY mc.member_id, mc.offset')
+
         current_member_id = None
+        
         row = cursor.fetchone()
         while row:
             member_id, offset, length = row
             if member_id != current_member_id:
                 current_member_id = member_id
                 current_offset = 0
-                tag = cursor2.execute('SELECT name FROM member WHERE id=?',
+                tag = cursor2.execute('SELECT name FROM member WHERE member_id=?',
                                       (member_id,)).fetchone()[0]
             if offset != current_offset:
                 if offset < current_offset:
@@ -713,24 +775,17 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
 
             row = cursor.fetchone()
 
-        # Check all lengths in member match chunk totals
-        cursor.execute('''
-SELECT member.name
-
-FROM
-    member,
-
-    (SELECT member_id, sum(length) AS length
-     FROM chunk GROUP BY member_id) AS chunk_lengths
-
-WHERE
-      member.id = chunk_lengths.member_id
-      AND member.length != chunk_lengths.length''')
+        cursor.execute('SELECT sum(chunk.length), member.length, member.name ' +
+                       'FROM chunk INNER JOIN mc ON chunk.chunk_id=mc.chunk_id ' +
+                       'INNER JOIN member ON mc.member_id=member.member_id ' +
+                       'GROUP BY mc.member_id')
         
         row = cursor.fetchone()
         while row:
-            print 'Length mismatch in %s' % row[0]
-            status = False
+            clen, mlen, tag = row
+            if clen != mlen:
+                print 'Length mismatch in %s' % tag
+                status = False
             row = cursor.fetchone()
 
         return status
@@ -852,12 +907,12 @@ class RemoteArchive(Archive):
         def _process_have_chunk_reply(reply):
             assert(reply.HasField('have_chunk_reply'))
             assert(reply.have_chunk_reply.sha256 == h)
-            return reply.have_chunk_reply.have
+            return reply.have_chunk_reply.chunk_id
 
         return self._request(request, _process_have_chunk_reply)
 
     def _store_chunk(self, member_id, cursor, data, offset, length,
-                     sha256=None):
+                     sha256=None, chunk_id=None):
         if sha256 is None:
             sha256 = hashlib.sha256(data).digest()
         request = synctus.ddar_pb2.Request()
@@ -867,6 +922,8 @@ class RemoteArchive(Archive):
         r.sha256 = sha256
         r.offset = offset
         r.length = length
+        if chunk_id is not None:
+            r.chunk_id = chunk_id
 
         def _process_store_chunk_reply(reply):
             assert(reply.HasField('store_chunk_reply'))

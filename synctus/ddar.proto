@@ -3,7 +3,7 @@ message HaveChunkRequest {
 }
 
 message HaveChunkReply {
-	required bool have = 1;
+	required uint64 chunk_id = 1;
 
 	// including the hash of the chunk the reply corresponds to will
 	// allow an assertion to check for bugs, but in future this could
@@ -16,6 +16,7 @@ message StoreChunkRequest {
 	required bytes sha256 = 2;
 	required uint64 offset = 3;
 	required uint64 length = 4;
+	optional uint64 chunk_id = 5;
 }
 
 message StoreChunkReply {
