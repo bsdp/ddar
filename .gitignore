@@ -1,0 +1,11 @@
+db.erm
+build
+dist
+ddar.egg-info
+synctus/ddar_pb2.py
+synctus/_dds.so
+*.pyc
+*.pyo
+*~
+*.pydevproject
+*.project
