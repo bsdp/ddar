@@ -647,17 +647,35 @@ CREATE TABLE chunk (chunk_id INTEGER NOT NULL,
             all((d in cls.hexdigits for d in h)))
 
     def _fsck_fs(self):
+        """Cross reference each file object with the database.
+        
+        If an valid, yet unknown object is found in the file system, this
+        method will ultimately return False.
+        
+        """
+        
         status = True
-
+        objects = os.path.join(self.dirname, 'objects')
+        objectdirs = os.listdir(objects)
         cursor = self.db.cursor()
-        for h in os.listdir(os.path.join(self.dirname, 'objects')):
-            if not self._valid_hex_hash(h):
+        
+        for basename in objectdirs:
+            
+            objectdir = os.path.join(objects, basename)  # objects/basename
+            if not os.path.isdir(objectdir):
                 continue
-            cursor.execute('SELECT 1 FROM chunk WHERE hash=? LIMIT 1',
-                           (buffer(binascii.unhexlify(h)),))
-            if not cursor.fetchone():
-                print 'Unknown object %s' % h
-                status = False
+            
+            for object in os.listdir(objectdir):
+                
+                h = basename + object
+                
+                if not self._valid_hex_hash(h):
+                    continue
+                cursor.execute('SELECT 1 FROM chunk WHERE hash=? LIMIT 1',
+                               (buffer(binascii.unhexlify(h)),))
+                if not cursor.fetchone():
+                    print 'Unknown object %s' % h
+                    status = False
 
         return status
 
@@ -700,6 +718,7 @@ CREATE TABLE chunk (chunk_id INTEGER NOT NULL,
 
         cursor1 = self.db.cursor()
         cursor2 = self.db.cursor()
+        
         # Check each member hash is correct
         cursor1.execute('SELECT member_id, name, hash FROM member')
         row = cursor1.fetchone()
