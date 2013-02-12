@@ -227,7 +227,7 @@ CREATE TABLE chunk (chunk_id INTEGER NOT NULL,
         UNIQUE (chunk_id), 
         UNIQUE (hash))''')
         
-        cursor.execute('CREATE UNIQUE INDEX udx_mc_member_id_offset ON "mc" (member_id, "offset")')
+        cursor.execute('CREATE UNIQUE INDEX udx_mc_member_id_offset_chunk_id ON "mc" (member_id, "offset", chunk_id)')
         cursor.execute('CREATE INDEX idx_mc_chunk_id ON "mc" (chunk_id)')
 
     def _create(self):
